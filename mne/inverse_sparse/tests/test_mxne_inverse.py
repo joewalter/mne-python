@@ -16,6 +16,7 @@ from mne.inverse_sparse.mxne_inverse import make_stc_from_dipoles
 from mne.minimum_norm import apply_inverse, make_inverse_operator
 from mne.utils import run_tests_if_main, slow_test
 from mne.dipole import Dipole
+from mne.source_estimate import VolSourceEstimate
 
 
 data_path = testing.data_path(download=False)
@@ -24,6 +25,8 @@ fname_data = op.join(data_path, 'MEG', 'sample', 'sample_audvis-ave.fif')
 fname_cov = op.join(data_path, 'MEG', 'sample', 'sample_audvis-cov.fif')
 fname_fwd = op.join(data_path, 'MEG', 'sample',
                     'sample_audvis_trunc-meg-eeg-oct-6-fwd.fif')
+fname_fwd_vol = op.join(data_path, 'MEG', 'sample',
+                        'sample_audvis_trunc-meg-vol-7-fwd.fif')
 label = 'Aud-rh'
 fname_label = op.join(data_path, 'MEG', 'sample', 'labels', '%s.label' % label)
 
@@ -123,10 +126,42 @@ def test_mxne_inverse():
     alpha_time = 1.  # temporal regularization parameter
 
     stc, _ = tf_mixed_norm(evoked, forward, cov, alpha_space, alpha_time,
-                           loose=loose, depth=depth, maxit=100, tol=1e-4,
+                           loose=loose, depth=depth, maxit=100, tol=1e-6,
                            tstep=4, wsize=16, window=0.1, weights=stc_dspm,
                            weights_min=weights_min, return_residual=True)
     assert_array_almost_equal(stc.times, evoked.times, 5)
     assert_true(stc.vertices[1][0] in label.vertices)
 
+    # Tests with volume source spaces
+    forward_vol = read_forward_solution(fname_fwd_vol, force_fixed=False,
+                                        surf_ori=False)
+
+    # Reduce source space to make test computation faster
+    inverse_operator = make_inverse_operator(evoked_l21.info, forward_vol,
+                                             cov, loose=None, depth=None,
+                                             fixed=False)
+    stc_dspm = apply_inverse(evoked_l21, inverse_operator, lambda2=1. / 9.,
+                             method='dSPM')
+    stc_dspm.data[np.abs(stc_dspm.data) < 12] = 0.0
+    stc_dspm.data[np.abs(stc_dspm.data) >= 12] = 1.
+    weights_min = 0.5
+
+    # MxNE tests
+    alpha = 70  # spatial regularization parameter
+    stc_vol = mixed_norm(evoked_l21, forward_vol, cov, alpha, loose=1.0,
+                         depth=0.5, maxit=300, tol=1e-8, active_set_size=10,
+                         weights=stc_dspm, weights_min=weights_min,
+                         solver='bcd')
+    assert_array_almost_equal(stc_vol.times, evoked_l21.times, 5)
+    assert_true(isinstance(stc_vol, VolSourceEstimate))
+
+    # Do with TF-MxNE for test memory savings
+    alpha_space = 60.  # spatial regularization parameter
+    alpha_time = 1.  # temporal regularization parameter
+    stc = tf_mixed_norm(evoked, forward_vol, cov, alpha_space, alpha_time,
+                        loose=1.0, depth=0.5, maxit=100, tol=1e-6,
+                        tstep=4, wsize=16, window=0.05, weights=stc_dspm,
+                        weights_min=weights_min, return_residual=False)
+    assert_array_almost_equal(stc.times, evoked.times, 5)
+    assert_true(isinstance(stc, VolSourceEstimate))
 run_tests_if_main()

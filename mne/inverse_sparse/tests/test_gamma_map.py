@@ -17,6 +17,8 @@ from mne.inverse_sparse.mxne_inverse import make_stc_from_dipoles
 from mne import pick_types_forward
 from mne.utils import run_tests_if_main, slow_test
 from mne.dipole import Dipole
+from mne.source_estimate import VolSourceEstimate
+
 
 data_path = testing.data_path(download=False)
 fname_evoked = op.join(data_path, 'MEG', 'sample',
@@ -24,6 +26,8 @@ fname_evoked = op.join(data_path, 'MEG', 'sample',
 fname_cov = op.join(data_path, 'MEG', 'sample', 'sample_audvis-cov.fif')
 fname_fwd = op.join(data_path, 'MEG', 'sample',
                     'sample_audvis_trunc-meg-eeg-oct-6-fwd.fif')
+fname_fwd_vol = op.join(data_path, 'MEG', 'sample',
+                        'sample_audvis_trunc-meg-vol-7-fwd.fif')
 subjects_dir = op.join(data_path, 'subjects')
 
 
@@ -85,4 +89,11 @@ def test_gamma_map():
                     loose=None, return_residual=False)
     _check_stc(stc, evoked, 85739, 20)
 
+    # Tests with volume source spaces
+    forward_vol = read_forward_solution(fname_fwd_vol, force_fixed=False,
+                                        surf_ori=False)
+    stc_vol = gamma_map(evoked, forward_vol, cov, alpha, tol=1e-4,
+                        xyz_same_gamma=True, update_mode=1)
+    assert_array_almost_equal(stc_vol.times, evoked.times, 5)
+    assert_true(isinstance(stc_vol, VolSourceEstimate))
 run_tests_if_main()

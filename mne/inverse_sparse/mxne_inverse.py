@@ -7,10 +7,11 @@ from copy import deepcopy
 import numpy as np
 from scipy import linalg, signal
 
-from ..source_estimate import SourceEstimate
+from ..source_estimate import (_make_stc, SourceEstimate, VolSourceEstimate)
 from ..minimum_norm.inverse import combine_xyz, _prepare_forward
 from ..minimum_norm.inverse import _check_reference
-from ..forward import compute_orient_prior, is_fixed_orient, _to_fixed_ori
+from ..forward import (compute_orient_prior, is_fixed_orient, _to_fixed_ori,
+                       convert_forward_solution)
 from ..io.pick import pick_channels_evoked
 from ..io.proj import deactivate_proj
 from ..utils import logger, verbose
@@ -24,7 +25,7 @@ from .mxne_optim import (mixed_norm_solver, iterative_mixed_norm_solver,
 @verbose
 def _prepare_weights(forward, gain, source_weighting, weights, weights_min):
     mask = None
-    if isinstance(weights, SourceEstimate):
+    if isinstance(weights, (SourceEstimate, VolSourceEstimate)):
         # weights = np.sqrt(np.sum(weights.data ** 2, axis=1))
         weights = np.max(np.abs(weights.data), axis=1)
     weights_max = np.max(weights)
@@ -62,15 +63,26 @@ def _prepare_gain_column(forward, info, noise_cov, pca, depth, loose, weights,
     logger.info('Whitening lead field matrix.')
     gain = np.dot(whitener, gain)
 
+    if (loose is not None) and (0 < loose < 1.0):
+        if not forward['surf_ori']:
+            forward = convert_forward_solution(forward, surf_ori=True)
+        orient_prior = np.sqrt(compute_orient_prior(forward, loose))
+        idx_start = 0
+        for src in forward['src']:
+            idx_end = idx_start + len(src['vertno']) * 3
+            if not (src['type'] == 'surf'):
+                orient_prior[idx_start : idx_end] = 1.0
+            idx_start = idx_end
+    else:
+        orient_prior = np.ones(gain.shape[1], dtype=gain.dtype)
+
     if depth is not None:
         depth_prior = np.sum(gain ** 2, axis=0) ** depth
         source_weighting = np.sqrt(depth_prior ** -1.)
     else:
         source_weighting = np.ones(gain.shape[1], dtype=gain.dtype)
 
-    if loose is not None and loose != 1.0:
-        source_weighting *= np.sqrt(compute_orient_prior(forward, loose))
-
+    source_weighting *= orient_prior
     gain *= source_weighting[None, :]
 
     if weights is None:
@@ -85,7 +97,25 @@ def _prepare_gain_column(forward, info, noise_cov, pca, depth, loose, weights,
 
 def _prepare_gain(forward, info, noise_cov, pca, depth, loose, weights,
                   weights_min, verbose=None):
-    if not isinstance(depth, float):
+    src_types = np.array([src['type'] for src in forward['src']])
+    if (len(src_types) == 1) and (src_types == 'vol').all():
+        loose = 1.0
+        logger.info('Setting loose = 1. for volume-based source spaces!')
+        if weights is not None:
+            if not isinstance(weights, VolSourceEstimate):
+                raise ValueError('Weights must be a volume-based '
+                                 'source estimate.')
+    elif (len(src_types) == 2) and (src_types == 'surf').all():
+        if weights is not None:
+            if not isinstance(weights, SourceEstimate):
+                raise ValueError('Weights must be a cortically constrained '
+                                 'source estimate.')
+    else:
+        raise Exception('Currently, this function supports only '
+                        'one volume-based source space or '
+                        'two surface-based source spaces.')
+
+    if (depth is not None) and (not isinstance(depth, float)):
         raise ValueError('Invalid depth parameter. '
                          'A float is required (got %s).'
                          % type(depth))
@@ -152,12 +182,15 @@ def _make_sparse_stc(X, active_set, forward, tmin, tstep,
 
     src = forward['src']
 
-    n_lh_points = len(src[0]['vertno'])
-    lh_vertno = src[0]['vertno'][active_idx[active_idx < n_lh_points]]
-    rh_vertno = src[1]['vertno'][active_idx[active_idx >= n_lh_points] -
-                                 n_lh_points]
-    vertices = [lh_vertno, rh_vertno]
-    stc = SourceEstimate(X, vertices=vertices, tmin=tmin, tstep=tstep)
+    n_points = 0
+    vertices = list()
+    for src in forward['src']:
+        n_points_new = len(src['vertno'])
+        idx_ = (active_idx >= n_points)
+        idx_ = idx_ & (active_idx < (n_points + n_points_new))
+        vertices.append(src['vertno'][active_idx[idx_] - n_points])
+        n_points += n_points_new
+    stc = _make_stc(X, vertices, tmin=tmin, tstep=tstep)
     return stc
 
 
@@ -211,19 +244,18 @@ def make_stc_from_dipoles(dipoles, src, verbose=None):
     Parameters
     ----------
     dipoles : Dipole | list of instances of Dipole
-        The dipoles to convert.
+        Dipoles to convert.
     src : instance of SourceSpaces
         The source space used to generate the forward operator.
     verbose : bool, str, int, or None
         If not None, override default verbose level (see :func:`mne.verbose`
         and :ref:`Logging documentation <tut_logging>` for more).
-
     Returns
     -------
-    stc : SourceEstimate
+    stc : SourceEstimate | VolSourceEstimate | MixedSourceEstimate
         The source estimate.
     """
-    logger.info('Converting dipoles into a SourceEstimate.')
+    logger.info('Converting dipoles into a source estimate.')
     if isinstance(dipoles, Dipole):
         dipoles = [dipoles]
     if not isinstance(dipoles, list):
@@ -235,9 +267,14 @@ def make_stc_from_dipoles(dipoles, src, verbose=None):
     X = np.zeros((len(dipoles), len(dipoles[0].times)))
     source_rr = np.concatenate([_src['rr'][_src['vertno'], :] for _src in src],
                                axis=0)
-    n_lh_points = len(src[0]['vertno'])
-    lh_vertno = list()
-    rh_vertno = list()
+    n_points = 0
+    vertices = list()
+    n_src_per_space = [n_points]
+    for _src in src:
+        n_points += len(_src['vertno'])
+        n_src_per_space.append(n_points)
+        vertices.append([])
+
     for i in range(len(dipoles)):
         if not np.all(dipoles[i].pos == dipoles[i].pos[0]):
             raise ValueError('Only dipoles with fixed position over time '
@@ -245,13 +282,12 @@ def make_stc_from_dipoles(dipoles, src, verbose=None):
         X[i] = dipoles[i].amplitude
         idx = np.all(source_rr == dipoles[i].pos[0], axis=1)
         idx = np.where(idx)[0][0]
-        if idx < n_lh_points:
-            lh_vertno.append(src[0]['vertno'][idx])
-        else:
-            rh_vertno.append(src[1]['vertno'][idx - n_lh_points])
-    vertices = [np.array(lh_vertno).astype(int),
-                np.array(rh_vertno).astype(int)]
-    stc = SourceEstimate(X, vertices=vertices, tmin=tmin, tstep=tstep)
+        for i, _src in enumerate(src):
+            if idx < n_src_per_space[i + 1]:
+                vertices[i].append(_src['vertno'][idx - n_src_per_space[i]])
+                break
+    vertices = [np.array(vert).astype(int) for vert in vertices]
+    stc = _make_stc(X, vertices, tmin=tmin, tstep=tstep)
     logger.info('[done]')
     return stc
 
@@ -322,8 +358,10 @@ def mixed_norm(evoked, forward, noise_cov, alpha, loose=0.2, depth=0.8,
 
     Returns
     -------
-    stc : SourceEstimate | list of SourceEstimate
-        Source time courses for each evoked data passed as input.
+    stc : SourceEstimate | VolSourceEstimate | MixedSourceEstimate |
+          list of (SourceEstimate | VolSourceEstimate | MixedSourceEstimate) |
+          Dipole | list of Dipole
+        The source estimate for each evoked data passed as input.
     residual : instance of Evoked
         The residual a.k.a. data not explained by the sources.
         Only returned if return_residual is True.
@@ -542,8 +580,8 @@ def tf_mixed_norm(evoked, forward, noise_cov, alpha_space, alpha_time,
 
     Returns
     -------
-    stc : instance of SourceEstimate
-        Source time courses.
+    stc : SourceEstimate | VolSourceEstimate | MixedSourceEstimate | Dipole
+        The source estimate.
     residual : instance of Evoked
         The residual a.k.a. data not explained by the sources.
         Only returned if return_residual is True.
